@@ -1,0 +1,148 @@
+name: Android Build (NusaMusic)
+
+# Dijalankan manual: tab Actions > "Android Build (NusaMusic)" > Run workflow.
+# Dasar perintah: README YMusicV4 (ffmpeg-build di ../ffmpeg-build, scripts/build-android.sh <abi>,
+# ./gradlew :androidApp:installDebug => varian debug dari modul :androidApp).
+# BELUM DIUJI. Versi NDK/CMake bergantung pada runner dan skrip ffmpeg-build: baca log jika gagal.
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft_release:
+        description: "Buat DRAFT release berisi APK (tidak dipublikasikan)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      # Dua repo berdampingan agar ../ffmpeg-build dari folder app valid.
+      - name: Checkout app
+        uses: actions/checkout@v4
+        with:
+          path: app
+          submodules: recursive
+
+      - name: Checkout ffmpeg-build
+        uses: actions/checkout@v4
+        with:
+          repository: ymusic-io/ffmpeg-build
+          path: ffmpeg-build
+          submodules: recursive
+
+      - name: Revisi ffmpeg-build
+        id: ffrev
+        run: echo "sha=$(git -C ffmpeg-build rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache hasil build FFmpeg arm64
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-build
+          key: ffmpeg-android-arm64-${{ steps.ffrev.outputs.sha }}
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Info lingkungan
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          cmake --version || true
+          java -version
+          node --version
+
+      - name: Build FFmpeg (arm64-v8a)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        working-directory: ffmpeg-build
+        run: bash scripts/build-android.sh arm64-v8a
+
+      # Untuk build debug saja. Jangan commit secrets.properties asli ke repo.
+      # Jika proyek butuh nilai rahasia, simpan di GitHub Secrets, bukan di file.
+      - name: Siapkan secrets.properties (placeholder dari contoh)
+        working-directory: app
+        run: |
+          if [ ! -f secrets.properties ] && [ -f secrets.properties.example ]; then
+            cp secrets.properties.example secrets.properties
+            echo "secrets.properties dibuat dari contoh (nilai kosong/placeholder)."
+          fi
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK debug (:androidApp)
+        working-directory: app
+        run: |
+          chmod +x gradlew
+          ./gradlew :androidApp:assembleDebug --stacktrace
+
+      - name: Periksa APK (lokasi, minSdk, ABI)
+        working-directory: app
+        run: |
+          APK=$(find androidApp/build/outputs/apk/debug -name '*.apk' | head -n1)
+          test -n "$APK" || { echo "APK tidak ditemukan"; exit 1; }
+          echo "APK: $APK"
+          ls -lh "$APK"
+          echo "--- ABI native di dalam APK ---"
+          unzip -l "$APK" | awk '{print $4}' | grep -E '^lib/[^/]+/' | cut -d/ -f1-2 | sort | uniq -c || true
+          echo "--- Info manifest ---"
+          AAPT2="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n1)aapt2"
+          "$AAPT2" dump badging "$APK" | grep -E "^package:|sdkVersion|targetSdkVersion|native-code" || true
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nusamusic-debug-apk
+          path: app/androidApp/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload laporan build jika gagal
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            app/**/build/reports/**
+          if-no-files-found: ignore
+
+  draft-release:
+    needs: build
+    if: ${{ inputs.draft_release }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Unduh APK
+        uses: actions/download-artifact@v4
+        with:
+          name: nusamusic-debug-apk
+          path: apk
+
+      # --draft: tidak terlihat publik sampai Anda menekan Publish sendiri.
+      - name: Buat draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "debug-${{ github.run_number }}" apk/*.apk \
+            --repo "${{ github.repository }}" \
+            --draft --prerelease \
+            --title "NusaMusic debug #${{ github.run_number }}" \
+            --notes "Build debug otomatis. Belum diuji sampai dikonfirmasi pemilik."
